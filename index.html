@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Súper Control - Gestión de Freezers</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, updateDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Configuración de Firebase (inyectada automáticamente por el sistema)
+        const firebaseConfig = JSON.parse(window.__firebase_config || '{}');
+        const appId = window.__app_id || 'control-frezz-martin';
+        const initialToken = window.__initial_auth_token;
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // Estado global de la aplicación
+        let state = {
+            freezers: [],
+            stats: { clean: 0, expired: 0, pending: 0 },
+            isInitializing: false,
+            currentUser: null
+        };
+
+        const CLEANING_INTERVAL_DAYS = 30;
+
+        // Inicialización de la App
+        async function init() {
+            try {
+                // Priorizar token personalizado si existe, sino usar anónimo
+                if (initialToken) {
+                    await signInWithCustomToken(auth, initialToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Error en autenticación:", err);
+            }
+
+            // Escuchar cambios en el estado de usuario
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    state.currentUser = user;
+                    startListening();
+                }
+            });
+        }
+
+        // Crear los documentos de los freezers si la base de datos está vacía
+        async function setupDatabase() {
+            if (state.isInitializing || !state.currentUser) return;
+            state.isInitializing = true;
+            
+            try {
+                // Crear 28 freezers
+                for (let i = 1; i <= 28; i++) {
+                    const freezerPath = doc(db, 'artifacts', appId, 'public', 'data', 'freezers', i.toString());
+                    await setDoc(freezerPath, {
+                        number: i,
+                        lastCleaned: null,
+                        updatedAt: new Date().toISOString()
+                    });
+                }
+            } catch (error) {
+                console.error("Error inicializando base de datos:", error);
+            } finally {
+                state.isInitializing = false;
+            }
+        }
+
+        // Escuchar datos en tiempo real de Firestore
+        function startListening() {
+            if (!state.currentUser) return;
+
+            const collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'freezers');
+            
+            onSnapshot(collectionRef, (snapshot) => {
+                if (snapshot.empty) {
+                    setupDatabase();
+                    return;
+                }
+
+                const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                // Ordenar localmente por número de freezer
+                state.freezers = docs.sort((a, b) => a.number - b.number);
+                
+                updateStats();
+                render();
+            }, (error) => {
+                console.error("Error de permisos en Firestore:", error);
+                if (error.code === 'permission-denied') {
+                    showErrorMessage("No tienes permisos suficientes para acceder a los datos.");
+                }
+            });
+        }
+
+        // Acción: Marcar un freezer como limpio hoy
+        window.handleClean = async (number) => {
+            if (!state.currentUser) return;
+            try {
+                const freezerDoc = doc(db, 'artifacts', appId, 'public', 'data', 'freezers', number.toString());
+                await updateDoc(freezerDoc, {
+                    lastCleaned: new Date().toISOString()
+                });
+            } catch (err) {
+                console.error("Error al actualizar freezer:", err);
+            }
+        };
+
+        // Cálculos de estadísticas
+        function updateStats() {
+            const now = new Date();
+            state.stats = { clean: 0, expired: 0, pending: 0 };
+
+            state.freezers.forEach(f => {
+                if (!f.lastCleaned) {
+                    state.stats.pending++;
+                } else {
+                    const lastDate = new Date(f.lastCleaned);
+                    const diffTime = Math.abs(now - lastDate);
+                    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+                    if (diffDays >= CLEANING_INTERVAL_DAYS) {
+                        state.stats.expired++;
+                    } else {
+                        state.stats.clean++;
+                    }
+                }
+            });
+        }
+
+        // Generar el HTML de cada tarjeta de freezer
+        function createFreezerCard(f) {
+            const now = new Date();
+            let status = { label: 'Pendiente', color: 'text-slate-400', border: 'border-slate-200', icon: 'clock', bg: 'bg-white' };
+            let dateText = 'Sin registro';
+
+            if (f.lastCleaned) {
+                const lastDate = new Date(f.lastCleaned);
+                const diffDays = Math.ceil(Math.abs(now - lastDate) / (1000 * 60 * 60 * 24));
+                dateText = lastDate.toLocaleDateString();
+
+                if (diffDays >= CLEANING_INTERVAL_DAYS) {
+                    status = { label: 'Vencido', color: 'text-red-600', border: 'border-red-200', icon: 'alert-circle', bg: 'bg-red-50' };
+                } else {
+                    status = { label: 'Limpio', color: 'text-emerald-600', border: 'border-emerald-200', icon: 'check-circle', bg: 'bg-emerald-50' };
+                }
+            }
+
+            return `
+                <div class="${status.bg} rounded-2xl border-2 ${status.border} p-4 flex flex-col justify-between shadow-sm min-h-[120px] transition-all active:scale-95">
+                    <div class="flex justify-between items-start">
+                        <span class="bg-slate-800 text-white text-xs font-black px-2 py-1 rounded-md">${f.number}</span>
+                        <i data-lucide="${status.icon}" class="${status.color} w-5 h-5"></i>
+                    </div>
+                    <div class="mt-2">
+                        <p class="text-[11px] font-black uppercase tracking-widest ${status.color}">${status.label}</p>
+                        <p class="text-[10px] text-slate-400 font-medium">${dateText}</p>
+                    </div>
+                    <button onclick="handleClean(${f.number})" 
+                            class="mt-3 w-full py-2 rounded-xl text-[11px] font-bold uppercase tracking-tight transition-all bg-blue-600 text-white shadow-md active:bg-blue-800 disabled:opacity-30"
+                            ${(f.lastCleaned && (Math.abs(now - new Date(f.lastCleaned)) / 36e5 < 12)) ? 'disabled' : ''}>
+                        ${(f.lastCleaned && (Math.abs(now - new Date(f.lastCleaned)) / 36e5 < 12)) ? 'Hecho' : 'Limpiar'}
+                    </button>
+                </div>
+            `;
+        }
+
+        function showErrorMessage(msg) {
+            const app = document.getElementById('app');
+            app.innerHTML = `
+                <div class="flex flex-col items-center justify-center h-screen p-6 text-center">
+                    <i data-lucide="shield-alert" class="w-16 h-16 text-red-500 mb-4"></i>
+                    <h2 class="text-xl font-bold text-slate-800">Error de Configuración</h2>
+                    <p class="text-slate-500 mt-2">${msg}</p>
+                    <button onclick="location.reload()" class="mt-6 bg-slate-800 text-white px-6 py-2 rounded-full font-bold">Reintentar</button>
+                </div>
+            `;
+            lucide.createIcons();
+        }
+
+        // Renderizado principal
+        function render() {
+            const app = document.getElementById('app');
+            const hNorth = state.freezers.filter(f => [1, 2].includes(f.number));
+            const aisleA = state.freezers.filter(f => f.number >= 3 && f.number <= 14);
+            const aisleB = state.freezers.filter(f => f.number >= 15 && f.number <= 26);
+            const hSouth = state.freezers.filter(f => [27, 28].includes(f.number));
+
+            app.innerHTML = `
+                <header class="bg-slate-900 text-white px-6 py-5 sticky top-0 z-30 shadow-xl print:hidden">
+                    <div class="max-w-5xl mx-auto flex justify-between items-center">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="snowflake" class="text-blue-400 w-6 h-6"></i>
+                            <h1 class="text-lg font-black tracking-tighter uppercase">Súper Control</h1>
+                        </div>
+                        <button onclick="window.print()" class="bg-blue-600 hover:bg-blue-500 p-2 rounded-full text-white transition-all">
+                            <i data-lucide="printer" class="w-5 h-5"></i>
+                        </button>
+                    </div>
+                </header>
+
+                <main class="max-w-5xl mx-auto p-4 space-y-6">
+                    <!-- Dashboard -->
+                    <div class="grid grid-cols-3 gap-3 print:hidden">
+                        <div class="bg-white rounded-2xl p-4 shadow-sm border text-center">
+                            <p class="text-[10px] font-bold text-emerald-600 uppercase">Limpios</p>
+                            <p class="text-2xl font-black text-emerald-700">${state.stats.clean}</p>
+                        </div>
+                        <div class="bg-white rounded-2xl p-4 shadow-sm border text-center">
+                            <p class="text-[10px] font-bold text-red-600 uppercase">Vencidos</p>
+                            <p class="text-2xl font-black text-red-700">${state.stats.expired}</p>
+                        </div>
+                        <div class="bg-white rounded-2xl p-4 shadow-sm border text-center text-slate-400">
+                            <p class="text-[10px] font-bold uppercase">Restan</p>
+                            <p class="text-2xl font-black">${state.stats.pending}</p>
+                        </div>
+                    </div>
+
+                    <!-- Mapa de Freezers -->
+                    <div class="space-y-12 py-6">
+                        <!-- Sector Norte -->
+                        <div class="flex flex-col items-center gap-4">
+                            <span class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] border-b-2 border-slate-200 pb-1">Cabecera Norte</span>
+                            <div class="flex gap-4">${hNorth.map(createFreezerCard).join('')}</div>
+                        </div>
+
+                        <!-- Pasillos Centrales -->
+                        <div class="grid grid-cols-2 gap-8 md:gap-16">
+                            <div class="space-y-4">
+                                <h3 class="text-[10px] font-black text-slate-400 uppercase text-right border-r-4 border-slate-200 pr-3">Pasillo Izq</h3>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    ${aisleA.map(createFreezerCard).join('')}
+                                </div>
+                            </div>
+                            <div class="space-y-4">
+                                <h3 class="text-[10px] font-black text-slate-400 uppercase text-left border-l-4 border-slate-200 pl-3">Pasillo Der</h3>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    ${aisleB.map(createFreezerCard).join('')}
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Sector Sur -->
+                        <div class="flex flex-col items-center gap-4 pt-8 border-t-2 border-dashed border-slate-200">
+                            <span class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] border-b-2 border-slate-200 pb-1">Cabecera Sur</span>
+                            <div class="flex gap-4">${hSouth.map(createFreezerCard).join('')}</div>
+                        </div>
+                    </div>
+                </main>
+
+                <footer class="p-8 text-center text-slate-300 text-[10px] font-bold uppercase tracking-widest">
+                    Freezer Master Pro &copy; 2024
+                </footer>
+            `;
+            lucide.createIcons();
+        }
+
+        window.onload = init;
+    </script>
+    <style>
+        body { -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+        @media print {
+            nav, header, button, .print\:hidden { display: none !important; }
+            main { padding: 0 !important; max-width: none !important; }
+            .bg-slate-50 { background-color: white !important; }
+        }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+    <div id="app">
+        <div class="flex flex-col items-center justify-center h-screen">
+            <div class="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+            <p class="mt-4 text-slate-400 font-black text-xs uppercase tracking-[0.3em] animate-pulse">Sincronizando Freezers...</p>
+        </div>
+    </div>
+</body>
+</html>
